@@ -268,6 +268,33 @@ impl<N: NodePrimitives> Deref for StaticFileProvider<N> {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct BeforeCacheInsertHook(
+    parking_lot::Mutex<Option<Box<dyn FnOnce(StaticFileSegment) + Send + 'static>>>,
+);
+
+#[cfg(test)]
+impl Debug for BeforeCacheInsertHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BeforeCacheInsertHook").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl BeforeCacheInsertHook {
+    fn set(&self, hook: impl FnOnce(StaticFileSegment) + Send + 'static) {
+        let previous = self.0.lock().replace(Box::new(hook));
+        assert!(previous.is_none(), "cache fill hook already installed");
+    }
+
+    fn fire(&self, segment: StaticFileSegment) {
+        if let Some(hook) = self.0.lock().take() {
+            hook(segment);
+        }
+    }
+}
+
 /// [`StaticFileProviderInner`] manages all existing [`StaticFileJarProvider`].
 #[derive(Debug)]
 pub struct StaticFileProviderInner<N> {
@@ -301,6 +328,8 @@ pub struct StaticFileProviderInner<N> {
     _lock_file: Option<StorageLock>,
     /// Genesis block number, default is 0;
     genesis_block_number: u64,
+    #[cfg(test)]
+    before_cache_insert: BeforeCacheInsertHook,
 }
 
 impl<N: NodePrimitives> StaticFileProviderInner<N> {
@@ -328,6 +357,8 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             blocks_per_file,
             _lock_file,
             genesis_block_number: 0,
+            #[cfg(test)]
+            before_cache_insert: Default::default(),
         };
 
         Ok(provider)
@@ -974,7 +1005,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Creating jar from scratch");
             let path = self.path.join(segment.filename(fixed_block_range));
             let jar = NippyJar::load(&path).map_err(ProviderError::other)?;
-            self.map.entry(key).insert(LoadedJar::new(jar)?).downgrade().into()
+            let loaded = LoadedJar::new(jar)?;
+            #[cfg(test)]
+            self.before_cache_insert.fire(segment);
+            // `update_index` may have published a newer snapshot while this jar was loading.
+            self.map.entry(key).or_insert(loaded).downgrade().into()
         };
 
         if let Some(metrics) = &self.metrics {
@@ -3060,13 +3095,81 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::mpsc, thread};
 
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
     use reth_chain_state::EthPrimitives;
     use reth_db::test_utils::create_test_static_files_dir;
     use reth_static_file_types::{SegmentRangeInclusive, StaticFileSegment};
 
-    use crate::{providers::StaticFileProvider, StaticFileProviderBuilder};
+    use super::StaticFileWriter;
+    use crate::{providers::StaticFileProvider, BlockHashReader, StaticFileProviderBuilder};
+
+    #[test]
+    fn cache_fill_does_not_overwrite_finalized_header_jar() -> eyre::Result<()> {
+        let (static_dir, _) = create_test_static_files_dir();
+        let static_files: StaticFileProvider<EthPrimitives> =
+            StaticFileProviderBuilder::read_write(&static_dir)
+                .with_blocks_per_file_for_segment(StaticFileSegment::Headers, 10)
+                .with_blocks_per_file_for_segment(StaticFileSegment::Receipts, 2)
+                .build()?;
+
+        let hash_0 = B256::from([0x10; 32]);
+        let mut header_0 = Header::default();
+        header_0.number = 0;
+        {
+            let mut writer = static_files.latest_writer(StaticFileSegment::Headers)?;
+            writer.append_header(&header_0, &hash_0)?;
+            writer.commit()?;
+        }
+
+        // Create two receipt jars so pruning the first one clears the shared jar cache.
+        {
+            let mut writer = static_files.latest_writer(StaticFileSegment::Receipts)?;
+            for block in 0..=3 {
+                writer.increment_block(block)?;
+            }
+            writer.commit()?;
+        }
+
+        assert_eq!(static_files.block_hash(0)?, Some(hash_0));
+        static_files.delete_jar(StaticFileSegment::Receipts, 0)?;
+
+        let (loaded_tx, loaded_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        static_files.before_cache_insert.set(move |segment| {
+            assert_eq!(segment, StaticFileSegment::Headers);
+            loaded_tx.send(()).expect("test controller dropped");
+            resume_rx.recv().expect("test controller dropped");
+        });
+
+        // Pause a header cache fill after it loads the jar containing block 0.
+        let reader_static_files = static_files.clone();
+        let reader = thread::spawn(move || reader_static_files.block_hash(0));
+        loaded_rx.recv().expect("reader did not reach cache-fill hook");
+
+        // Finalize block 1 while the reader holds the older snapshot of the same jar.
+        let hash_1 = B256::from([0x11; 32]);
+        let mut header_1 = Header::default();
+        header_1.number = 1;
+        {
+            let mut writer = static_files.latest_writer(StaticFileSegment::Headers)?;
+            writer.append_header(&header_1, &hash_1)?;
+            writer.commit()?;
+        }
+
+        resume_tx.send(()).expect("reader dropped before cache publication");
+        assert_eq!(reader.join().expect("reader panicked")?, Some(hash_0));
+
+        assert_eq!(
+            static_files.block_hash(1)?,
+            Some(hash_1),
+            "cache fill replaced the newer jar published by update_index"
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn test_find_fixed_range_with_block_index() -> eyre::Result<()> {
